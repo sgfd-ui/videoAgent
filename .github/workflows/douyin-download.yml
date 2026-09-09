@@ -7,34 +7,113 @@ on:
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
       - name: Install tools
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -U yt-dlp
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
-      - name: Download Douyin video
+          python -m pip install -U playwright requests
+          ffmpeg -version >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
+      - name: Open Douyin in browser and capture video
         shell: bash
         run: |
-          set -x
-          yt-dlp --version
-          URL_SHORT='https://v.douyin.com/8Ox-gCkNV6M/'
-          URL_LONG='https://www.douyin.com/video/7682230527038746447'
-          yt-dlp -v --no-playlist -o 'douyin_video.%(ext)s' "$URL_SHORT" || \
-          yt-dlp -v --no-playlist -o 'douyin_video.%(ext)s' "$URL_LONG"
-          VIDEO=$(find . -maxdepth 1 -type f -name 'douyin_video.*' | head -n 1)
-          test -n "$VIDEO"
-          ffmpeg -y -i "$VIDEO" -vn -ac 1 -ar 16000 audio.wav
-          ls -lh "$VIDEO" audio.wav
+          python - <<'PY'
+          import os, requests
+          from playwright.sync_api import sync_playwright
+
+          URL = 'https://www.douyin.com/video/7682230527038746447'
+          captured = []
+          ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(
+                  channel='chrome',
+                  headless=True,
+                  args=['--no-sandbox', '--disable-blink-features=AutomationControlled']
+              )
+              context = browser.new_context(
+                  user_agent=ua,
+                  locale='zh-CN',
+                  viewport={'width': 1280, 'height': 900}
+              )
+              page = context.new_page()
+
+              def on_response(resp):
+                  try:
+                      ct = (resp.headers.get('content-type') or '').lower()
+                      u = resp.url
+                      if ct.startswith('video/') or 'douyinvod.com' in u or 'bytevcloud' in u:
+                          captured.append((u, ct, resp.status))
+                  except Exception:
+                      pass
+
+              page.on('response', on_response)
+              page.goto(URL, wait_until='domcontentloaded', timeout=90000)
+              page.wait_for_timeout(15000)
+              print('PAGE_TITLE=', page.title())
+              print('PAGE_URL=', page.url)
+
+              src = None
+              videos = page.locator('video')
+              if videos.count():
+                  try:
+                      src = videos.first.evaluate('(v) => v.currentSrc || v.src || null')
+                  except Exception:
+                      pass
+              print('VIDEO_ELEMENT_SRC=', src)
+              print('CAPTURED_VIDEO_RESPONSES=', len(captured))
+              for i, item in enumerate(captured[-20:]):
+                  print('CAPTURE', i, item[2], item[1], item[0][:500])
+
+              page.screenshot(path='douyin_page.png', full_page=False)
+              cookies = context.cookies()
+              referer = page.url
+              browser.close()
+
+          candidates = []
+          if src and src.startswith('http'):
+              candidates.append(src)
+          for u, ct, status in reversed(captured):
+              if u.startswith('http') and u not in candidates:
+                  candidates.append(u)
+
+          if not candidates:
+              raise RuntimeError('No direct video URL found in rendered page/network responses')
+
+          cookie_dict = {c['name']: c['value'] for c in cookies}
+          headers = {'User-Agent': ua, 'Referer': referer, 'Accept': '*/*'}
+
+          last_error = None
+          for idx, video_url in enumerate(candidates[:20]):
+              try:
+                  print('TRY_VIDEO_URL', idx, video_url[:500])
+                  with requests.get(video_url, headers=headers, cookies=cookie_dict, stream=True, timeout=60, allow_redirects=True) as r:
+                      print('HTTP', r.status_code, r.headers.get('content-type'), r.headers.get('content-length'))
+                      r.raise_for_status()
+                      with open('douyin_video.mp4', 'wb') as f:
+                          for chunk in r.iter_content(1024 * 1024):
+                              if chunk:
+                                  f.write(chunk)
+                  size = os.path.getsize('douyin_video.mp4')
+                  print('DOWNLOADED_BYTES=', size)
+                  if size > 100000:
+                      break
+              except Exception as e:
+                  last_error = e
+                  print('DOWNLOAD_FAILED', repr(e))
+          else:
+              raise RuntimeError(f'All candidate video URLs failed: {last_error!r}')
+          PY
+
+          ffmpeg -y -i douyin_video.mp4 -vn -ac 1 -ar 16000 audio.wav
+          ls -lh douyin_video.mp4 audio.wav douyin_page.png
       - name: Upload result
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: douyin-result
           path: |
-            douyin_video.*
+            douyin_video.mp4
             audio.wav
+            douyin_page.png
           if-no-files-found: warn
