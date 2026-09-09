@@ -11,7 +11,7 @@ permissions:
 jobs:
   transcribe:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -20,34 +20,81 @@ jobs:
           path: prior
           github-token: ${{ github.token }}
           run-id: 34377594972
-      - name: Fast segmented ASR
+
+      - name: Wenzhounese ASR with WenetSpeech-Wu
         shell: bash
         run: |
           set -euxo pipefail
-          python -m pip install -U faster-whisper
+          python -m pip install -U sherpa-onnx soundfile numpy
+          wget -q --show-progress https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-wenetspeech-wu-u2pp-conformer-ctc-zh-int8-2026-02-03.tar.bz2
+          tar xf sherpa-onnx-wenetspeech-wu-u2pp-conformer-ctc-zh-int8-2026-02-03.tar.bz2
           python - <<'PY'
-          import wave, os, numpy as np
-          from faster_whisper import WhisperModel
-          with wave.open('prior/audio.wav','rb') as w:
-              rate=w.getframerate(); x=np.frombuffer(w.readframes(w.getnframes()),dtype=np.int16)
-          spans=[(0.35,3.30),(3.50,6.48),(6.55,10.10),(10.02,13.86),(13.82,18.94),(19.15,21.29)]
-          os.makedirs('segments',exist_ok=True)
-          model=WhisperModel('large-v3-turbo',device='cpu',compute_type='int8')
-          out=[]
+          import os, json, wave
+          import numpy as np
+          import soundfile as sf
+          import sherpa_onnx
+
+          model_dir='sherpa-onnx-wenetspeech-wu-u2pp-conformer-ctc-zh-int8-2026-02-03'
+          rec=sherpa_onnx.OfflineRecognizer.from_wenet_ctc(
+              model=f'{model_dir}/model.int8.onnx',
+              tokens=f'{model_dir}/tokens.txt',
+              num_threads=4,
+              sample_rate=16000,
+              feature_dim=80,
+              decoding_method='greedy_search',
+              debug=False,
+          )
+
+          audio, sr=sf.read('prior/audio.wav',dtype='float32',always_2d=False)
+          if getattr(audio,'ndim',1)>1:
+              audio=audio[:,0]
+          if sr != 16000:
+              raise RuntimeError(f'Expected 16k audio, got {sr}')
+
+          def decode(x):
+              st=rec.create_stream()
+              st.accept_waveform(sr, x)
+              rec.decode_stream(st)
+              r=st.result
+              return {'text':r.text,'tokens':list(r.tokens),'timestamps':list(r.timestamps)}
+
+          results={}
+          results['full']=decode(audio)
+
+          spans=[(0.0,4.0),(3.5,8.0),(7.5,12.0),(11.5,16.0),(15.5,21.29)]
+          results['segments']=[]
           for i,(a,b) in enumerate(spans,1):
-              p=f'segments/{i:02d}.wav'; y=x[int(a*rate):int(b*rate)]
-              with wave.open(p,'wb') as z:
-                  z.setnchannels(1); z.setsampwidth(2); z.setframerate(rate); z.writeframes(y.tobytes())
-              segs,info=model.transcribe(p,beam_size=5,vad_filter=False,temperature=0.0,condition_on_previous_text=False,task='transcribe')
-              ss=list(segs); txt=' '.join(s.text.strip() for s in ss).strip()
-              avg=sum(s.avg_logprob for s in ss)/len(ss) if ss else -99
-              line=f'SEG{i} lang={info.language} p={info.language_probability:.4f} logp={avg:.4f}: {txt}'
-              print(line); out.append(line)
-          open('fast_segments.txt','w',encoding='utf-8').write('\n'.join(out))
+              x=audio[int(a*sr):int(b*sr)]
+              z=decode(x)
+              z.update({'segment':i,'start':a,'end':b})
+              results['segments'].append(z)
+
+          # Also try short non-overlapping chunks to reduce long-utterance errors.
+          spans2=[(0.0,3.5),(3.5,7.0),(7.0,10.5),(10.5,14.0),(14.0,17.5),(17.5,21.29)]
+          results['short_segments']=[]
+          for i,(a,b) in enumerate(spans2,1):
+              z=decode(audio[int(a*sr):int(b*sr)])
+              z.update({'segment':i,'start':a,'end':b})
+              results['short_segments'].append(z)
+
+          with open('wenzhou_asr.json','w',encoding='utf-8') as f:
+              json.dump(results,f,ensure_ascii=False,indent=2)
+          with open('wenzhou_asr.txt','w',encoding='utf-8') as f:
+              f.write('FULL:\n'+results['full']['text']+'\n\n')
+              f.write('OVERLAP SEGMENTS:\n')
+              for r in results['segments']:
+                  f.write(f"[{r['start']:.2f}-{r['end']:.2f}] {r['text']}\n")
+              f.write('\nSHORT SEGMENTS:\n')
+              for r in results['short_segments']:
+                  f.write(f"[{r['start']:.2f}-{r['end']:.2f}] {r['text']}\n")
+          print(open('wenzhou_asr.txt',encoding='utf-8').read())
           PY
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: fast-segmented-asr
-          path: fast_segments.txt
+          name: wenzhou-asr
+          path: |
+            wenzhou_asr.txt
+            wenzhou_asr.json
           if-no-files-found: warn
