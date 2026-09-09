@@ -7,106 +7,166 @@ on:
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Install tools
-        run: |
-          python -m pip install -U playwright requests
-          ffmpeg -version >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
-      - name: Open Douyin in browser and capture video
+      - name: Parse Douyin share data
         shell: bash
         run: |
           python - <<'PY'
-          import os, requests
-          from playwright.sync_api import sync_playwright
+          import json, os, re, sys, requests, subprocess
 
-          URL = 'https://www.douyin.com/video/7682230527038746447'
-          captured = []
-          ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
+          AWEME_ID = '7682230527038746447'
+          IPHONE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1'
+          DESKTOP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
+          sess = requests.Session()
+          sess.headers.update({'User-Agent': IPHONE_UA, 'Accept-Language': 'zh-CN,zh;q=0.9'})
 
-          with sync_playwright() as p:
-              browser = p.chromium.launch(
-                  channel='chrome',
-                  headless=True,
-                  args=['--no-sandbox', '--disable-blink-features=AutomationControlled']
-              )
-              context = browser.new_context(
-                  user_agent=ua,
-                  locale='zh-CN',
-                  viewport={'width': 1280, 'height': 900}
-              )
-              page = context.new_page()
-
-              def on_response(resp):
-                  try:
-                      ct = (resp.headers.get('content-type') or '').lower()
-                      u = resp.url
-                      if ct.startswith('video/') or 'douyinvod.com' in u or 'bytevcloud' in u:
-                          captured.append((u, ct, resp.status))
-                  except Exception:
-                      pass
-
-              page.on('response', on_response)
-              page.goto(URL, wait_until='domcontentloaded', timeout=90000)
-              page.wait_for_timeout(15000)
-              print('PAGE_TITLE=', page.title())
-              print('PAGE_URL=', page.url)
-
-              src = None
-              videos = page.locator('video')
-              if videos.count():
-                  try:
-                      src = videos.first.evaluate('(v) => v.currentSrc || v.src || null')
-                  except Exception:
-                      pass
-              print('VIDEO_ELEMENT_SRC=', src)
-              print('CAPTURED_VIDEO_RESPONSES=', len(captured))
-              for i, item in enumerate(captured[-20:]):
-                  print('CAPTURE', i, item[2], item[1], item[0][:500])
-
-              page.screenshot(path='douyin_page.png', full_page=False)
-              cookies = context.cookies()
-              referer = page.url
-              browser.close()
-
-          candidates = []
-          if src and src.startswith('http'):
-              candidates.append(src)
-          for u, ct, status in reversed(captured):
-              if u.startswith('http') and u not in candidates:
-                  candidates.append(u)
-
-          if not candidates:
-              raise RuntimeError('No direct video URL found in rendered page/network responses')
-
-          cookie_dict = {c['name']: c['value'] for c in cookies}
-          headers = {'User-Agent': ua, 'Referer': referer, 'Accept': '*/*'}
-
-          last_error = None
-          for idx, video_url in enumerate(candidates[:20]):
+          def extract_router_data(html):
+              token = 'window._ROUTER_DATA'
+              pos = html.find(token)
+              if pos < 0:
+                  return None
+              eq = html.find('=', pos)
+              brace = html.find('{', eq)
+              if brace < 0:
+                  return None
               try:
-                  print('TRY_VIDEO_URL', idx, video_url[:500])
-                  with requests.get(video_url, headers=headers, cookies=cookie_dict, stream=True, timeout=60, allow_redirects=True) as r:
-                      print('HTTP', r.status_code, r.headers.get('content-type'), r.headers.get('content-length'))
+                  obj, _ = json.JSONDecoder().raw_decode(html[brace:])
+                  return obj
+              except Exception as e:
+                  print('ROUTER_PARSE_ERR', repr(e))
+                  return None
+
+          def walk(obj):
+              if isinstance(obj, dict):
+                  yield obj
+                  for v in obj.values():
+                      yield from walk(v)
+              elif isinstance(obj, list):
+                  for v in obj:
+                      yield from walk(v)
+
+          def find_item(data):
+              if not data:
+                  return None
+              exact=[]; fallback=[]
+              for d in walk(data):
+                  aid = str(d.get('aweme_id') or d.get('awemeId') or d.get('id') or '')
+                  if aid == AWEME_ID and isinstance(d.get('video'), dict):
+                      exact.append(d)
+                  elif isinstance(d.get('video'), dict) and d.get('author') and (d.get('desc') is not None):
+                      fallback.append(d)
+              return exact[0] if exact else (fallback[0] if fallback else None)
+
+          def url_candidates(item):
+              out=[]
+              video=item.get('video') or {}
+              for key in ['play_addr_h264','play_addr','download_addr']:
+                  node=video.get(key) or {}
+                  for u in node.get('url_list') or []:
+                      if isinstance(u,str) and u.startswith('http') and u not in out:
+                          out.append(u.replace('/playwm/','/play/').replace('playwm','play'))
+              for br in video.get('bit_rate') or []:
+                  node=br.get('play_addr') or br.get('play_addr_265') or {}
+                  for u in node.get('url_list') or []:
+                      if isinstance(u,str) and u.startswith('http') and u not in out:
+                          out.append(u.replace('/playwm/','/play/').replace('playwm','play'))
+              uri=((video.get('play_addr') or {}).get('uri') or (video.get('play_addr_h264') or {}).get('uri'))
+              if uri:
+                  out.append(f'https://aweme.snssdk.com/aweme/v1/play/?video_id={uri}&ratio=1080p&line=0')
+              return out
+
+          item=None
+          sources=[]
+          share_urls=[
+              f'https://www.iesdouyin.com/share/video/{AWEME_ID}/',
+              f'https://www.douyin.com/share/video/{AWEME_ID}/',
+          ]
+          for u in share_urls:
+              try:
+                  r=sess.get(u, timeout=30, allow_redirects=True, headers={'Referer':'https://www.douyin.com/'})
+                  print('SHARE', u, '->', r.status_code, r.url, 'len=', len(r.text), 'ct=', r.headers.get('content-type'))
+                  open('share_page.html','w',encoding='utf-8').write(r.text)
+                  data=extract_router_data(r.text)
+                  cand=find_item(data)
+                  if cand:
+                      item=cand; sources.append('router_data'); break
+              except Exception as e:
+                  print('SHARE_ERR', u, repr(e))
+
+          if not item:
+              api=f'https://www.iesdouyin.com/web/api/v2/aweme/iteminfo/?item_ids={AWEME_ID}'
+              try:
+                  r=sess.get(api, timeout=30, headers={'Accept':'application/json','Referer':'https://www.iesdouyin.com/'})
+                  print('ITEMINFO', r.status_code, 'len=', len(r.content), 'ct=', r.headers.get('content-type'))
+                  if r.ok and r.text.strip().startswith('{'):
+                      data=r.json(); item=find_item(data); sources.append('iteminfo') if item else None
+              except Exception as e:
+                  print('ITEMINFO_ERR', repr(e))
+
+          if not item:
+              try:
+                  api='https://douyin.wtf/api'
+                  r=requests.get(api, params={'url':'https://v.douyin.com/8Ox-gCkNV6M/'}, timeout=30, headers={'User-Agent':DESKTOP_UA})
+                  print('DOUYIN_WTF', r.status_code, 'len=', len(r.content), 'ct=', r.headers.get('content-type'))
+                  open('douyin_wtf_response.txt','wb').write(r.content)
+                  if r.ok and 'application/json' in (r.headers.get('content-type') or ''):
+                      j=r.json()
+                      vu=j.get('video_url') or (j.get('data') or {}).get('video_url')
+                      if vu:
+                          item={'aweme_id':AWEME_ID,'desc':j.get('video_title') or '', 'author':{'nickname':j.get('video_author') or ''}, 'video':{'play_addr':{'url_list':[vu]}}}
+                          sources.append('douyin.wtf')
+              except Exception as e:
+                  print('DOUYIN_WTF_ERR', repr(e))
+
+          if not item:
+              raise RuntimeError('Failed to obtain target aweme metadata from all strategies')
+
+          author=(item.get('author') or {}).get('nickname') or ''
+          desc=item.get('desc') or ''
+          duration=(item.get('video') or {}).get('duration') or item.get('duration') or 0
+          print('SOURCE=', sources)
+          print('AWEME_ID=', item.get('aweme_id'))
+          print('AUTHOR=', author)
+          print('DESC=', desc)
+          print('DURATION_MS=', duration)
+
+          meta={'source':sources,'aweme_id':str(item.get('aweme_id') or AWEME_ID),'author':author,'desc':desc,'duration_ms':duration}
+          open('metadata.json','w',encoding='utf-8').write(json.dumps(meta,ensure_ascii=False,indent=2))
+
+          candidates=url_candidates(item)
+          print('CANDIDATES=', len(candidates))
+          if not candidates:
+              raise RuntimeError('Target metadata found, but no playable video URLs found')
+
+          headers={'User-Agent':IPHONE_UA,'Referer':'https://www.iesdouyin.com/','Accept':'*/*'}
+          best=None
+          for i,u in enumerate(candidates[:20]):
+              try:
+                  print('TRY', i, u[:500])
+                  with sess.get(u, headers=headers, stream=True, timeout=60, allow_redirects=True) as r:
+                      print('VIDEO_HTTP', i, r.status_code, r.headers.get('content-type'), r.headers.get('content-length'), 'final=', r.url[:300])
                       r.raise_for_status()
-                      with open('douyin_video.mp4', 'wb') as f:
-                          for chunk in r.iter_content(1024 * 1024):
-                              if chunk:
-                                  f.write(chunk)
-                  size = os.path.getsize('douyin_video.mp4')
-                  print('DOWNLOADED_BYTES=', size)
+                      path=f'candidate_{i}.mp4'
+                      with open(path,'wb') as f:
+                          for chunk in r.iter_content(1024*1024):
+                              if chunk: f.write(chunk)
+                  size=os.path.getsize(path)
+                  print('SIZE', i, size)
                   if size > 100000:
+                      best=path
                       break
               except Exception as e:
-                  last_error = e
-                  print('DOWNLOAD_FAILED', repr(e))
-          else:
-              raise RuntimeError(f'All candidate video URLs failed: {last_error!r}')
+                  print('VIDEO_ERR', i, repr(e))
+          if not best:
+              raise RuntimeError('All target video URLs failed to download')
+          os.replace(best,'douyin_video.mp4')
+          subprocess.run(['ffmpeg','-y','-i','douyin_video.mp4','-vn','-ac','1','-ar','16000','audio.wav'],check=True)
           PY
 
-          ffmpeg -y -i douyin_video.mp4 -vn -ac 1 -ar 16000 audio.wav
-          ls -lh douyin_video.mp4 audio.wav douyin_page.png
+          ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 douyin_video.mp4 | tee video_duration.txt
+          ls -lh douyin_video.mp4 audio.wav metadata.json video_duration.txt
       - name: Upload result
         if: always()
         uses: actions/upload-artifact@v4
@@ -115,5 +175,8 @@ jobs:
           path: |
             douyin_video.mp4
             audio.wav
-            douyin_page.png
+            metadata.json
+            video_duration.txt
+            share_page.html
+            douyin_wtf_response.txt
           if-no-files-found: warn
