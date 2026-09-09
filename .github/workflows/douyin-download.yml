@@ -11,74 +11,43 @@ permissions:
 jobs:
   transcribe:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-
-      - name: Download known-good video/audio artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: douyin-result
           path: prior
           github-token: ${{ github.token }}
           run-id: 34377594972
-
-      - name: Segment and transcribe each utterance
+      - name: Fast segmented ASR
         shell: bash
         run: |
           set -euxo pipefail
           python -m pip install -U faster-whisper
           python - <<'PY'
-          import wave, os
-          import numpy as np
+          import wave, os, numpy as np
           from faster_whisper import WhisperModel
-
-          src='prior/audio.wav'
-          with wave.open(src,'rb') as w:
-              rate=w.getframerate(); ch=w.getnchannels(); sw=w.getsampwidth()
-              x=np.frombuffer(w.readframes(w.getnframes()),dtype=np.int16)
-          assert rate==16000 and ch==1 and sw==2, (rate,ch,sw)
-
-          # Boundaries from silencedetect (-35 dB, 0.25 s), padded slightly.
+          with wave.open('prior/audio.wav','rb') as w:
+              rate=w.getframerate(); x=np.frombuffer(w.readframes(w.getnframes()),dtype=np.int16)
           spans=[(0.35,3.30),(3.50,6.48),(6.55,10.10),(10.02,13.86),(13.82,18.94),(19.15,21.29)]
           os.makedirs('segments',exist_ok=True)
-          for i,(a,b) in enumerate(spans,1):
-              y=x[int(a*rate):int(b*rate)]
-              p=f'segments/{i:02d}.wav'
-              with wave.open(p,'wb') as w:
-                  w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate); w.writeframes(y.tobytes())
-
           model=WhisperModel('large-v3-turbo',device='cpu',compute_type='int8')
-          langs=['my','zh','th','vi','lo','km']
           out=[]
-          for i in range(1,7):
-              p=f'segments/{i:02d}.wav'
-              print(f'===== SEGMENT {i} =====')
+          for i,(a,b) in enumerate(spans,1):
+              p=f'segments/{i:02d}.wav'; y=x[int(a*rate):int(b*rate)]
+              with wave.open(p,'wb') as z:
+                  z.setnchannels(1); z.setsampwidth(2); z.setframerate(rate); z.writeframes(y.tobytes())
               segs,info=model.transcribe(p,beam_size=5,vad_filter=False,temperature=0.0,condition_on_previous_text=False,task='transcribe')
-              txt=' '.join(s.text.strip() for s in segs).strip()
-              print(f'AUTO lang={info.language} prob={info.language_probability:.4f} text={txt!r}')
-              out.append(f'SEG {i}\nAUTO {info.language} {info.language_probability:.4f}: {txt}')
-              for lang in langs:
-                  segs2,info2=model.transcribe(p,language=lang,beam_size=3,vad_filter=False,temperature=0.0,condition_on_previous_text=False,task='transcribe')
-                  ss=list(segs2)
-                  txt2=' '.join(s.text.strip() for s in ss).strip()
-                  avg=sum(s.avg_logprob for s in ss)/len(ss) if ss else -99
-                  comp=max((s.compression_ratio for s in ss),default=0)
-                  nos=max((s.no_speech_prob for s in ss),default=0)
-                  print(f'{lang}: avg_logprob={avg:.4f} compression={comp:.3f} no_speech={nos:.3f} text={txt2!r}')
-                  out.append(f'{lang} logp={avg:.4f} comp={comp:.3f} ns={nos:.3f}: {txt2}')
-              # Direct English translation under Burmese assumption.
-              tr,_=model.transcribe(p,language='my',beam_size=3,vad_filter=False,temperature=0.0,condition_on_previous_text=False,task='translate')
-              en=' '.join(s.text.strip() for s in tr).strip()
-              print('MY->EN',repr(en))
-              out.append(f'MY->EN: {en}\n')
-          open('segmented_results.txt','w',encoding='utf-8').write('\n'.join(out))
+              ss=list(segs); txt=' '.join(s.text.strip() for s in ss).strip()
+              avg=sum(s.avg_logprob for s in ss)/len(ss) if ss else -99
+              line=f'SEG{i} lang={info.language} p={info.language_probability:.4f} logp={avg:.4f}: {txt}'
+              print(line); out.append(line)
+          open('fast_segments.txt','w',encoding='utf-8').write('\n'.join(out))
           PY
-
-      - name: Upload segmented results
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: segmented-asr
-          path: segmented_results.txt
+          name: fast-segmented-asr
+          path: fast_segments.txt
           if-no-files-found: warn
