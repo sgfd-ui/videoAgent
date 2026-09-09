@@ -7,11 +7,11 @@ on:
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Parse and download via live API
+      - name: Parse and download target video
         shell: bash
         run: |
           set -euxo pipefail
@@ -24,16 +24,16 @@ jobs:
           req=urllib.request.Request(api,headers={'User-Agent':'Mozilla/5.0'})
           with urllib.request.urlopen(req,timeout=45) as r:
               body=r.read()
-          print(body[:1200].decode('utf-8','replace'))
           open('parser_response.json','wb').write(body)
           data=json.loads(body)
           d=data.get('data') or data
+          if d.get('author') != '杜拉垃哥':
+              raise RuntimeError(f'Unexpected author: {d.get("author")}')
           video_url=d.get('url') or d.get('video') or d.get('play_url')
           if isinstance(video_url,dict):
               video_url=video_url.get('url') or video_url.get('play_url')
           if not isinstance(video_url,str) or not video_url.startswith('http'):
               raise RuntimeError(f'No video URL in parser response: {data}')
-          print('VIDEO_URL=',video_url[:500])
           req=urllib.request.Request(video_url,headers={'User-Agent':'Mozilla/5.0','Referer':'https://www.douyin.com/'})
           with urllib.request.urlopen(req,timeout=90) as r, open('douyin_video.mp4','wb') as f:
               while True:
@@ -44,9 +44,8 @@ jobs:
           PY
           ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 douyin_video.mp4 | tee video_duration.txt
           ffmpeg -y -i douyin_video.mp4 -vn -ac 1 -ar 16000 audio.wav
-          ls -lh douyin_video.mp4 audio.wav
 
-      - name: Transcribe audio
+      - name: High accuracy transcription and translation
         if: success()
         shell: bash
         run: |
@@ -54,27 +53,58 @@ jobs:
           python -m pip install -U faster-whisper
           python - <<'PY'
           from faster_whisper import WhisperModel
-          model=WhisperModel('small', device='cpu', compute_type='int8')
-          segments,info=model.transcribe('audio.wav', beam_size=5, vad_filter=True)
-          lines=[]
-          print('DETECTED_LANGUAGE=',info.language,'PROB=',info.language_probability)
-          for s in segments:
+
+          model=WhisperModel('large-v3-turbo', device='cpu', compute_type='int8')
+
+          # Pass 1: automatic language detection, no VAD so short speech is not dropped.
+          segs,info=model.transcribe(
+              'audio.wav', beam_size=5, vad_filter=False,
+              temperature=0.0, condition_on_previous_text=False,
+              task='transcribe'
+          )
+          auto=[]
+          print('AUTO_LANGUAGE=',info.language,'PROB=',info.language_probability)
+          for s in segs:
               line=f'[{s.start:.2f}-{s.end:.2f}] {s.text.strip()}'
-              print(line); lines.append(line)
-          open('transcript.txt','w',encoding='utf-8').write('\n'.join(lines))
+              print('AUTO',line); auto.append(line)
+          open('transcript_auto.txt','w',encoding='utf-8').write('\n'.join(auto))
           open('language.txt','w',encoding='utf-8').write(f'{info.language}\t{info.language_probability}\n')
+
+          # Pass 2: first pass identified `my` (Myanmar/Burmese); force it for a stable transcript.
+          segs2,info2=model.transcribe(
+              'audio.wav', language='my', beam_size=5, vad_filter=False,
+              temperature=0.0, condition_on_previous_text=False,
+              task='transcribe'
+          )
+          my=[]
+          for s in segs2:
+              line=f'[{s.start:.2f}-{s.end:.2f}] {s.text.strip()}'
+              print('MY',line); my.append(line)
+          open('transcript_my.txt','w',encoding='utf-8').write('\n'.join(my))
+
+          # Pass 3: Whisper's translate task gives an independent English semantic rendering.
+          segs3,info3=model.transcribe(
+              'audio.wav', language='my', beam_size=5, vad_filter=False,
+              temperature=0.0, condition_on_previous_text=False,
+              task='translate'
+          )
+          en=[]
+          for s in segs3:
+              line=f'[{s.start:.2f}-{s.end:.2f}] {s.text.strip()}'
+              print('EN',line); en.append(line)
+          open('translation_en.txt','w',encoding='utf-8').write('\n'.join(en))
           PY
 
       - name: Upload result
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: douyin-result
+          name: douyin-result-large
           path: |
-            douyin_video.mp4
-            audio.wav
-            video_duration.txt
-            transcript.txt
-            language.txt
             parser_response.json
+            video_duration.txt
+            language.txt
+            transcript_auto.txt
+            transcript_my.txt
+            translation_en.txt
           if-no-files-found: warn
