@@ -7,133 +7,56 @@ on:
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: Parse via public Douyin API
+
+      - name: Download public Douyin video without cookies
         shell: bash
         run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
           python - <<'PY'
-          import json, os, subprocess, requests
-          from urllib.parse import quote
-
-          SHORT='https://v.douyin.com/8Ox-gCkNV6M/'
-          AWEME_ID='7682230527038746447'
-          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36'
-          s=requests.Session(); s.headers.update({'User-Agent':UA,'Accept':'application/json,text/plain,*/*'})
-
-          def walk(o):
-              if isinstance(o,dict):
-                  yield o
-                  for v in o.values(): yield from walk(v)
-              elif isinstance(o,list):
-                  for v in o: yield from walk(v)
-
-          def target_item(o):
-              fallback=None
-              for d in walk(o):
-                  aid=str(d.get('aweme_id') or d.get('awemeId') or d.get('id') or '')
-                  if aid==AWEME_ID and isinstance(d.get('video'),dict): return d
-                  if fallback is None and isinstance(d.get('video'),dict) and d.get('author'):
-                      fallback=d
-              return fallback
-
-          def urls_from(o):
-              out=[]
-              for d in walk(o):
-                  for k,v in d.items():
-                      lk=str(k).lower()
-                      if isinstance(v,str) and v.startswith('http') and ('video' in lk or 'play' in lk or 'download' in lk or 'url'==lk):
-                          if v not in out: out.append(v)
-                      elif lk in ('url_list','url_list_h264') and isinstance(v,list):
-                          for u in v:
-                              if isinstance(u,str) and u.startswith('http') and u not in out: out.append(u)
-              return out
-
-          endpoints=[
-              ('hybrid', 'https://api.douyin.wtf/api/hybrid/video_data', {'url':SHORT,'minimal':'false'}),
-              ('legacy', 'https://api.douyin.wtf/api', {'url':SHORT,'minimal':'false'}),
-          ]
-          payload=None; source=None
-          for name,url,params in endpoints:
-              try:
-                  r=s.get(url,params=params,timeout=45,allow_redirects=True)
-                  print('API',name,r.status_code,r.url,'ct=',r.headers.get('content-type'),'len=',len(r.content))
-                  open(f'{name}_response.txt','wb').write(r.content)
-                  if r.ok and 'json' in (r.headers.get('content-type') or '').lower():
-                      j=r.json()
-                      if target_item(j) or urls_from(j):
-                          payload=j; source=name; break
-              except Exception as e:
-                  print('API_ERR',name,repr(e))
-
-          direct_candidates=[]
-          if payload:
-              item=target_item(payload)
-              author=''; desc=''; duration=0
-              if item:
-                  author=(item.get('author') or {}).get('nickname') or ''
-                  desc=item.get('desc') or ''
-                  duration=(item.get('video') or {}).get('duration') or item.get('duration') or 0
-              meta={'source':source,'aweme_id':AWEME_ID,'author':author,'desc':desc,'duration_ms':duration}
-              print('META',json.dumps(meta,ensure_ascii=False))
-              open('metadata.json','w',encoding='utf-8').write(json.dumps(meta,ensure_ascii=False,indent=2))
-              direct_candidates=urls_from(item or payload)
-
-          direct_candidates += [
-              f'https://api.douyin.wtf/video/{AWEME_ID}',
-          ]
-          dedup=[]
-          for u in direct_candidates:
-              if u.startswith('http') and u not in dedup: dedup.append(u)
-          print('CANDIDATE_COUNT',len(dedup))
-
-          ok=False
-          for i,u in enumerate(dedup[:30]):
-              try:
-                  print('TRY',i,u[:500])
-                  r=requests.get(u,headers={'User-Agent':UA,'Referer':'https://www.douyin.com/'},stream=True,timeout=60,allow_redirects=True)
-                  ct=(r.headers.get('content-type') or '').lower()
-                  print('VIDEO_HTTP',i,r.status_code,ct,r.headers.get('content-length'),'final=',r.url[:300])
-                  if not r.ok: continue
-                  path=f'candidate_{i}.bin'
-                  with open(path,'wb') as f:
-                      for chunk in r.iter_content(1024*1024):
-                          if chunk: f.write(chunk)
-                  size=os.path.getsize(path)
-                  print('BYTES',i,size)
-                  if size>100000:
-                      probe=subprocess.run(['ffprobe','-v','error','-show_entries','format=duration','-of','default=nw=1:nk=1',path],capture_output=True,text=True)
-                      dur=(probe.stdout or '').strip()
-                      print('PROBE_DURATION',i,dur,'ERR',probe.stderr[:300])
-                      if dur:
-                          os.replace(path,'douyin_video.mp4'); ok=True; break
-              except Exception as e:
-                  print('DOWNLOAD_ERR',i,repr(e))
-          if not ok:
-              raise RuntimeError('Public API did not yield a playable target video')
-
-          subprocess.run(['ffmpeg','-y','-i','douyin_video.mp4','-vn','-ac','1','-ar','16000','audio.wav'],check=True)
+          import urllib.request
+          url='https://raw.githubusercontent.com/wyy1581672587-dot/douyin-public-downloader/main/douyin_public_downloader.py'
+          data=urllib.request.urlopen(url, timeout=30).read()
+          open('douyin_public_downloader.py','wb').write(data)
           PY
+          printf '%s\n' 'https://v.douyin.com/8Ox-gCkNV6M/' > links.txt
+          python douyin_public_downloader.py \
+            --links links.txt \
+            --output ./downloads \
+            --state ./state.json \
+            --log ./download_log.csv \
+            --retry 2
+          VIDEO=$(find downloads -type f -name '*.mp4' | head -n 1)
+          test -n "$VIDEO"
+          cp "$VIDEO" douyin_video.mp4
           ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 douyin_video.mp4 | tee video_duration.txt
-          ls -lh douyin_video.mp4 audio.wav video_duration.txt
+          ffmpeg -y -i douyin_video.mp4 -vn -ac 1 -ar 16000 audio.wav
+          ls -lh douyin_video.mp4 audio.wav
+
       - name: Transcribe audio
         if: success()
         shell: bash
         run: |
+          set -euxo pipefail
           python -m pip install -U faster-whisper
           python - <<'PY'
           from faster_whisper import WhisperModel
-          model=WhisperModel('base',device='cpu',compute_type='int8')
-          segments,info=model.transcribe('audio.wav',beam_size=5,vad_filter=True)
+          model=WhisperModel('small', device='cpu', compute_type='int8')
+          segments,info=model.transcribe('audio.wav', beam_size=5, vad_filter=True)
           lines=[]
           print('DETECTED_LANGUAGE=',info.language,'PROB=',info.language_probability)
           for s in segments:
               line=f'[{s.start:.2f}-{s.end:.2f}] {s.text.strip()}'
-              print(line); lines.append(line)
+              print(line)
+              lines.append(line)
           open('transcript.txt','w',encoding='utf-8').write('\n'.join(lines))
           open('language.txt','w',encoding='utf-8').write(f'{info.language}\t{info.language_probability}\n')
           PY
+
       - name: Upload result
         if: always()
         uses: actions/upload-artifact@v4
@@ -143,9 +66,8 @@ jobs:
             douyin_video.mp4
             audio.wav
             video_duration.txt
-            metadata.json
             transcript.txt
             language.txt
-            hybrid_response.txt
-            legacy_response.txt
+            state.json
+            download_log.csv
           if-no-files-found: warn
